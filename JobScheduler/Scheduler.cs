@@ -10,10 +10,6 @@ public sealed unsafe class Scheduler : IDisposable
     private int _nextWorkerIndex;
     private bool _isDisposed;
 
-    /// <summary>
-    /// Инициализирует новый экземпляр планировщика задач.
-    /// </summary>
-    /// <param name="threads">Количество рабочих потоков. Если 0, используется количество логических ядер процессора.</param>
     public Scheduler(int threads = 0)
     {
         _pool = new JobPool();
@@ -33,69 +29,67 @@ public sealed unsafe class Scheduler : IDisposable
     }
 
     /// <summary>
-    /// Планирует единичную задачу для выполнения.
+    /// Планирует единичную задачу.
     /// </summary>
-    /// <typeparam name="T">Тип структуры задачи.</typeparam>
-    /// <param name="job">Данные задачи.</param>
-    /// <param name="dependency">Опциональная задача, завершения которой необходимо дождаться перед запуском.</param>
-    /// <returns>Дескриптор запланированной задачи.</returns>
-    public JobHandle Schedule<T>(in T job, JobHandle dependency = default) where T : struct, IJob
+    public JobHandle Schedule<T>(in T job, JobHandle parent = default) where T : struct, IJob
     {
         int id = _pool.RentId();
+        int gen = Interlocked.Increment(ref _pool.Generations[id]);
         JobTypePool<T>.Payloads[id] = job;
 
-        int parentId = dependency.IsValid ? dependency.Index : -1;
-        if (parentId != -1)
-            Interlocked.Increment(ref _pool.Counters[parentId].Value);
+        JobHandle actualParent = default;
+        if (_pool.TryIncrementCounter(parent))
+        {
+            actualParent = parent;
+        }
 
-        _pool.SetupJob(id, &JobTypePool<T>.Execute, parentId);
-        Flush(id);
+        _pool.SetupJob(id, gen, &JobTypePool<T>.Execute, actualParent);
+        Flush(new JobHandle(id, gen));
 
-        return new JobHandle(id);
+        return new JobHandle(id, gen);
     }
 
     /// <summary>
-    /// Планирует параллельное выполнение задачи для массива данных.
-    /// Автоматически разделяет нагрузку на оптимальные батчи (чанки) для максимальной производительности.
+    /// Планирует задачу на выполнение массива с авто-батчингом.
     /// </summary>
-    /// <typeparam name="T">Тип структуры задачи.</typeparam>
-    /// <param name="job">Данные задачи.</param>
-    /// <param name="arrayLength">Общее количество элементов для обработки.</param>
-    /// <param name="dependency">Опциональная задача, завершения которой необходимо дождаться перед запуском.</param>
-    /// <returns>Дескриптор, представляющий всю группу параллельных задач.</returns>
-    public JobHandle Schedule<T>(in T job, int arrayLength, JobHandle dependency = default) where T : struct, IJob
+    public JobHandle Schedule<T>(in T job, int arrayLength, JobHandle parent = default) where T : struct, IJob
     {
-        if (arrayLength <= 0) return dependency;
+        if (arrayLength <= 0) return parent;
 
-        int batchSize = arrayLength / Workers.Count;
+        int batchSize = arrayLength / (Workers.Count * 4);
         if (batchSize < 128) batchSize = 128;
 
         int batches = (arrayLength + batchSize - 1) / batchSize;
 
+        // Fast-Path: Массив не делится
         if (batches == 1)
         {
             int id = _pool.RentId();
+            int gen = Interlocked.Increment(ref _pool.Generations[id]);
+
             ParallelJobTypePool<T>.Payloads[id] = job;
             ParallelJobTypePool<T>.StartIndices[id] = 0;
             ParallelJobTypePool<T>.EndIndices[id] = arrayLength;
 
-            int parentId = dependency.IsValid ? dependency.Index : -1;
-            if (parentId != -1) Interlocked.Increment(ref _pool.Counters[parentId].Value);
+            JobHandle actualParent = default;
+            if (_pool.TryIncrementCounter(parent)) actualParent = parent;
 
-            _pool.SetupJob(id, &ParallelJobTypePool<T>.Execute, parentId);
-            Flush(id);
+            _pool.SetupJob(id, gen, &ParallelJobTypePool<T>.Execute, actualParent);
+            Flush(new JobHandle(id, gen));
 
-            return new JobHandle(id);
+            return new JobHandle(id, gen);
         }
 
+        // Standard-Path: Создание узла для батчей
         int groupId = _pool.RentId();
+        int groupGen = Interlocked.Increment(ref _pool.Generations[groupId]);
         JobTypePool<EmptyJob>.Payloads[groupId] = default;
 
-        int pId = dependency.IsValid ? dependency.Index : -1;
-        if (pId != -1)
-            Interlocked.Increment(ref _pool.Counters[pId].Value);
+        JobHandle groupParent = default;
+        if (_pool.TryIncrementCounter(parent)) groupParent = parent;
 
-        _pool.SetupJob(groupId, &JobTypePool<EmptyJob>.Execute, pId);
+        _pool.SetupJob(groupId, groupGen, &JobTypePool<EmptyJob>.Execute, groupParent);
+        JobHandle groupHandle = new JobHandle(groupId, groupGen);
 
         for (int i = 0; i < batches; i++)
         {
@@ -103,26 +97,26 @@ public sealed unsafe class Scheduler : IDisposable
             int end = start + batchSize;
             if (end > arrayLength) end = arrayLength;
 
-            Interlocked.Increment(ref _pool.Counters[groupId].Value);
+            _pool.TryIncrementCounter(groupHandle);
+
             int id = _pool.RentId();
+            int gen = Interlocked.Increment(ref _pool.Generations[id]);
 
             ParallelJobTypePool<T>.Payloads[id] = job;
             ParallelJobTypePool<T>.StartIndices[id] = start;
             ParallelJobTypePool<T>.EndIndices[id] = end;
 
-            _pool.SetupJob(id, &ParallelJobTypePool<T>.Execute, groupId);
-            Flush(id);
+            _pool.SetupJob(id, gen, &ParallelJobTypePool<T>.Execute, groupHandle);
+            Flush(new JobHandle(id, gen));
         }
 
-        Flush(groupId);
-        return new JobHandle(groupId);
+        Flush(groupHandle);
+        return groupHandle;
     }
 
     /// <summary>
-    /// Блокирует текущий поток до полного завершения указанной задачи.
-    /// Во время ожидания текущий поток активно помогает выполнять задачи из очереди.
+    /// Ожидает завершения задачи, активно помогая её выполнять.
     /// </summary>
-    /// <param name="handle">Дескриптор задачи для ожидания.</param>
     public void Wait(JobHandle handle)
     {
         if (!handle.IsValid) return;
@@ -130,8 +124,12 @@ public sealed unsafe class Scheduler : IDisposable
         ref var counter = ref _pool.Counters[handle.Index];
         SpinWait spin = new SpinWait();
 
-        while (Volatile.Read(ref counter.Value) > 0)
+        while (true)
         {
+            long current = Volatile.Read(ref counter.Value);
+            if ((int)(current >> 32) != handle.Generation) break;
+            if ((int)current == 0) break;
+
             bool executedAny = false;
             for (int i = 0; i < Workers.Count; i++)
             {
@@ -155,12 +153,12 @@ public sealed unsafe class Scheduler : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal void Flush(int jobId)
+    internal void Flush(JobHandle jobHandle)
     {
         uint idx = (uint)Interlocked.Increment(ref _nextWorkerIndex);
         int workerIndex = (int)(idx % (uint)Workers.Count);
 
-        Workers[workerIndex].IncomingQueue.Enqueue(new JobHandle(jobId));
+        Workers[workerIndex].IncomingQueue.Enqueue(jobHandle);
         Workers[workerIndex].WakeUp();
     }
 
@@ -175,18 +173,23 @@ public sealed unsafe class Scheduler : IDisposable
     internal void Finish(JobHandle job)
     {
         int id = job.Index;
-        if (Interlocked.Decrement(ref _pool.Counters[id].Value) != 0) return;
 
-        int parent = _pool.Parents[id];
-        if (parent != -1) Finish(new JobHandle(parent));
-
-        int currentEdge = _pool.HeadEdge[id];
-        while (currentEdge != -1)
+        long current = Volatile.Read(ref _pool.Counters[id].Value);
+        long next;
+        while (true)
         {
-            int target = _pool.EdgeTargets[currentEdge];
-            Flush(target);
-            currentEdge = _pool.NextEdge[currentEdge];
+            if ((int)(current >> 32) != job.Generation) return;
+            next = current - 1;
+            long actual = Interlocked.CompareExchange(ref _pool.Counters[id].Value, next, current);
+            if (actual == current) break;
+            current = actual;
         }
+
+        if ((int)next != 0) return;
+
+        JobHandle parent = _pool.Parents[id];
+        if (parent.IsValid)
+            Finish(parent);
 
         _pool.Return(id);
     }

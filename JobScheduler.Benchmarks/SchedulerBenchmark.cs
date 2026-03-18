@@ -39,17 +39,17 @@ public class SchedulerBenchmark
     private ZeroAllocJobSchedulerCalculationJob _oldParentJob = null!;
     private ZeroAllocJobSchedulerCalculationJob[] _oldCachedJobs = null!;
 
-    [Params(100, 1000)]
+    [Params(100, 500)]
     public int JobsCount;
 
-    [GlobalSetup(Target = nameof(JobScheduler_New))]
-    public void SetupNew() => _scheduler = new MyJobScheduler();
+    [GlobalSetup(Target = nameof(MyJobScheduler))]
+    public void SetupMyJobScheduler() => _scheduler = new MyJobScheduler();
 
-    [GlobalCleanup(Target = nameof(JobScheduler_New))]
-    public void CleanupNew() => _scheduler?.Dispose();
+    [GlobalCleanup(Target = nameof(MyJobScheduler))]
+    public void CleanupMyJobScheduler() => _scheduler?.Dispose();
 
-    [GlobalSetup(Target = nameof(ZeroAllocJobScheduler_Original))]
-    public void SetupOld()
+    [GlobalSetup(Target = nameof(ZeroAllocJobScheduler))]
+    public void SetupZeroAllocJobScheduler()
     {
         var config = new ZeroAllocJobScheduler.Config();
         _oldScheduler = new ZeroAllocJobScheduler(in config);
@@ -60,8 +60,8 @@ public class SchedulerBenchmark
             _oldCachedJobs[i] = new ZeroAllocJobSchedulerCalculationJob { Iterations = 100 };
     }
 
-    [GlobalCleanup(Target = nameof(ZeroAllocJobScheduler_Original))]
-    public void CleanupOld() => _oldScheduler?.Dispose();
+    [GlobalCleanup(Target = nameof(ZeroAllocJobScheduler))]
+    public void CleanupZeroAllocJobScheduler() => _oldScheduler?.Dispose();
 
     [Benchmark(Baseline = true)]
     public void StandardParallelFor()
@@ -87,7 +87,7 @@ public class SchedulerBenchmark
     }
 
     [Benchmark]
-    public void JobScheduler_New()
+    public void MyJobScheduler()
     {
         var job = new CalculationJob { Iterations = 100 };
         var handle = _scheduler.Schedule(in job, JobsCount);
@@ -95,7 +95,7 @@ public class SchedulerBenchmark
     }
 
     [Benchmark]
-    public void ZeroAllocJobScheduler_Original()
+    public void ZeroAllocJobScheduler()
     {
         var parentHandle = _oldScheduler.Schedule(_oldParentJob);
 

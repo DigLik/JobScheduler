@@ -2,17 +2,15 @@
 
 namespace JobScheduler;
 
-[StructLayout(LayoutKind.Explicit, Size = 64)]
+[StructLayout(LayoutKind.Sequential)]
 internal struct JobCounter
 {
-    [FieldOffset(0)]
-    public int Value;
+    public long Value;
 }
 
 internal sealed unsafe class JobPool
 {
     public const int MaxJobs = 262144;
-    public const int MaxEdges = MaxJobs * 4;
 
     public struct JobMetadata
     {
@@ -20,30 +18,18 @@ internal sealed unsafe class JobPool
     }
 
     public readonly JobMetadata[] Jobs = new JobMetadata[MaxJobs];
-    public readonly int[] Parents = new int[MaxJobs];
+    public readonly JobHandle[] Parents = new JobHandle[MaxJobs];
     public readonly JobCounter[] Counters = new JobCounter[MaxJobs];
-
-    public readonly int[] HeadEdge = new int[MaxJobs];
-    public readonly int[] EdgeTargets = new int[MaxEdges];
-    public readonly int[] NextEdge = new int[MaxEdges];
+    public readonly int[] Generations = new int[MaxJobs];
 
     private long _freeJobsHead;
     private readonly int[] _freeJobsNext = new int[MaxJobs];
-
-    private long _freeEdgesHead;
-    private readonly int[] _freeEdgesNext = new int[MaxEdges];
 
     public JobPool()
     {
         for (int i = 0; i < MaxJobs - 1; i++) _freeJobsNext[i] = i + 1;
         _freeJobsNext[MaxJobs - 1] = -1;
         _freeJobsHead = 0;
-
-        for (int i = 0; i < MaxEdges - 1; i++) _freeEdgesNext[i] = i + 1;
-        _freeEdgesNext[MaxEdges - 1] = -1;
-        _freeEdgesHead = 0;
-
-        for (int i = 0; i < MaxJobs; i++) HeadEdge[i] = -1;
     }
 
     public int RentId()
@@ -62,35 +48,17 @@ internal sealed unsafe class JobPool
         return (int)(head & 0xFFFFFFFF);
     }
 
-    public void SetupJob(int id, delegate* managed<int, void> execute, int parentId)
+    public void SetupJob(int id, int gen, delegate* managed<int, void> execute, JobHandle parent)
     {
         Jobs[id].Execute = execute;
-        Parents[id] = parentId;
-        Counters[id].Value = 1;
-        HeadEdge[id] = -1;
+        Parents[id] = parent;
+        Counters[id].Value = ((long)gen << 32) | 1;
     }
 
     public void Return(int id)
     {
         Jobs[id].Execute = null;
-
-        int currentEdge = HeadEdge[id];
-        while (currentEdge != -1)
-        {
-            int nextEdge = NextEdge[currentEdge];
-
-            long edgeHead, edgeNext;
-            do
-            {
-                edgeHead = Volatile.Read(ref _freeEdgesHead);
-                _freeEdgesNext[currentEdge] = (int)(edgeHead & 0xFFFFFFFF);
-                long aba = (edgeHead >> 32) + 1;
-                edgeNext = (aba << 32) | (uint)currentEdge;
-            } while (Interlocked.CompareExchange(ref _freeEdgesHead, edgeNext, edgeHead) != edgeHead);
-
-            currentEdge = nextEdge;
-        }
-        HeadEdge[id] = -1;
+        Parents[id] = default;
 
         long jobHead, jobNext;
         do
@@ -102,29 +70,18 @@ internal sealed unsafe class JobPool
         } while (Interlocked.CompareExchange(ref _freeJobsHead, jobNext, jobHead) != jobHead);
     }
 
-    public void AddDependency(int dependOn, int dependency)
+    public bool TryIncrementCounter(JobHandle handle)
     {
-        long edgeHead, edgeNext;
-        do
-        {
-            edgeHead = Volatile.Read(ref _freeEdgesHead);
-            int index = (int)(edgeHead & 0xFFFFFFFF);
-            if (index == -1) throw new InvalidOperationException("Пул ребер исчерпан.");
-            int nextIndex = _freeEdgesNext[index];
-            long aba = (edgeHead >> 32) + 1;
-            edgeNext = (aba << 32) | (uint)nextIndex;
-        } while (Interlocked.CompareExchange(ref _freeEdgesHead, edgeNext, edgeHead) != edgeHead);
-
-        int edgeIdx = (int)(edgeHead & 0xFFFFFFFF);
-        EdgeTargets[edgeIdx] = dependency;
-
+        if (!handle.IsValid) return false;
+        long current = Volatile.Read(ref Counters[handle.Index].Value);
         while (true)
         {
-            int currentHead = HeadEdge[dependOn];
-            NextEdge[edgeIdx] = currentHead;
-
-            if (Interlocked.CompareExchange(ref HeadEdge[dependOn], edgeIdx, currentHead) == currentHead)
-                break;
+            if ((int)(current >> 32) != handle.Generation) return false;
+            if ((int)current == 0) return false;
+            long next = current + 1;
+            long actual = Interlocked.CompareExchange(ref Counters[handle.Index].Value, next, current);
+            if (actual == current) return true;
+            current = actual;
         }
     }
 }

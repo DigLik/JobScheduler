@@ -58,8 +58,7 @@ internal sealed class WorkStealingDeque<T>
 
         item = a[b & (a.Length - 1)];
 
-        if (size > 0)
-            return true;
+        if (size > 0) return true;
 
         if (Interlocked.CompareExchange(ref _top, t + 1, t) != t)
         {
