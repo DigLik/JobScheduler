@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="JobScheduler.Benchmarks/JobScheduler.Benchmarks.csproj" />
+  <Project Path="JobScheduler/JobScheduler.csproj" />
+</Solution>
