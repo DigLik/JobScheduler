@@ -53,67 +53,63 @@ internal sealed class Worker
         var token = _cts.Token;
         int idleSpins = 0;
 
-        try
+        while (!token.IsCancellationRequested)
         {
-            while (!token.IsCancellationRequested)
+            bool processedAny = false;
+            int transferred = 0;
+
+            while (transferred < 32 && IncomingQueue.TryDequeue(out var incomingJob))
             {
-                bool processedAny = false;
+                Queue.PushBottom(incomingJob);
+                transferred++;
+            }
 
-                int transferred = 0;
-                while (transferred < 32 && IncomingQueue.TryDequeue(out var incomingJob))
+            if (Queue.TryPopBottom(out var job))
+            {
+                _scheduler.ExecuteJob(job);
+                _scheduler.Finish(job);
+                processedAny = true;
+                idleSpins = 0;
+            }
+            else
+            {
+                for (int i = 0; i < _scheduler.Queues.Count; i++)
                 {
-                    Queue.PushBottom(incomingJob);
-                    transferred++;
-                }
+                    if (i == _workerId) continue;
 
-                if (Queue.TryPopBottom(out var job))
-                {
-                    _scheduler.ExecuteJob(job);
-                    _scheduler.Finish(job);
-                    processedAny = true;
-                    idleSpins = 0;
-                }
-                else
-                {
-                    for (int i = 0; i < _scheduler.Queues.Count; i++)
+                    if (_scheduler.Queues[i].TrySteal(out job))
                     {
-                        if (i == _workerId) continue;
-
-                        if (_scheduler.Queues[i].TrySteal(out job))
-                        {
-                            _scheduler.ExecuteJob(job);
-                            _scheduler.Finish(job);
-                            processedAny = true;
-                            idleSpins = 0;
-                            break;
-                        }
-                    }
-                }
-
-                if (!processedAny)
-                {
-                    if (idleSpins < 100)
-                    {
-                        Thread.SpinWait(10);
-                        idleSpins++;
-                    }
-                    else if (idleSpins < 500)
-                    {
-                        Thread.Yield();
-                        idleSpins++;
-                    }
-                    else
-                    {
-                        IsSleeping = 1;
-                        if (IncomingQueue.IsEmpty && Queue.Size() == 0)
-                        {
-                            _signal.WaitOne(2);
-                        }
-                        IsSleeping = 0;
+                        _scheduler.ExecuteJob(job);
+                        _scheduler.Finish(job);
+                        processedAny = true;
+                        idleSpins = 0;
+                        break;
                     }
                 }
             }
+
+            if (!processedAny)
+            {
+                if (idleSpins < 100)
+                {
+                    Thread.SpinWait(10);
+                    idleSpins++;
+                }
+                else if (idleSpins < 500)
+                {
+                    Thread.Yield();
+                    idleSpins++;
+                }
+                else
+                {
+                    IsSleeping = 1;
+                    if (IncomingQueue.IsEmpty && Queue.Size() == 0)
+                    {
+                        _signal.WaitOne(2);
+                    }
+                    IsSleeping = 0;
+                }
+            }
         }
-        catch (Exception) { }
     }
 }

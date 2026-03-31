@@ -30,6 +30,7 @@ public class ZeroAllocJobSchedulerCalculationJob : Schedulers.IJob
 }
 
 [MemoryDiagnoser]
+[DisassemblyDiagnoser(printSource: true, maxDepth: 4)]
 [Orderer(BenchmarkDotNet.Order.SummaryOrderPolicy.FastestToSlowest)]
 public class SchedulerBenchmark
 {
@@ -39,8 +40,7 @@ public class SchedulerBenchmark
     private ZeroAllocJobSchedulerCalculationJob _oldParentJob = null!;
     private ZeroAllocJobSchedulerCalculationJob[] _oldCachedJobs = null!;
 
-    [Params(100, 500)]
-    public int JobsCount;
+    public const int JobsCount = 500;
 
     [GlobalSetup(Target = nameof(MyJobScheduler))]
     public void SetupMyJobScheduler() => _scheduler = new MyJobScheduler();
@@ -64,7 +64,7 @@ public class SchedulerBenchmark
     public void CleanupZeroAllocJobScheduler() => _oldScheduler?.Dispose();
 
     [Benchmark(Baseline = true)]
-    public void StandardParallelFor()
+    public static void StandardParallelFor()
     {
         Parallel.For(0, JobsCount, _ =>
         {
@@ -74,7 +74,7 @@ public class SchedulerBenchmark
     }
 
     [Benchmark]
-    public async Task StandardTasksWhenAll()
+    public static async Task StandardTasksWhenAll()
     {
         var tasks = new Task[JobsCount];
         for (int i = 0; i < JobsCount; i++)

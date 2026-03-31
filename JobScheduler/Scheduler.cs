@@ -2,6 +2,9 @@
 
 namespace JobScheduler;
 
+/// <summary>
+/// Представляет планировщик задач, управляющий пулом рабочих потоков и распределением задач.
+/// </summary>
 public sealed unsafe class Scheduler : IDisposable
 {
     private readonly JobPool _pool;
@@ -10,6 +13,10 @@ public sealed unsafe class Scheduler : IDisposable
     private int _nextWorkerIndex;
     private bool _isDisposed;
 
+    /// <summary>
+    /// Инициализирует новый экземпляр планировщика задач.
+    /// </summary>
+    /// <param name="threads">Количество рабочих потоков. Если передано значение 0 или меньше, используется количество логических процессоров системы.</param>
     public Scheduler(int threads = 0)
     {
         _pool = new JobPool();
@@ -89,7 +96,7 @@ public sealed unsafe class Scheduler : IDisposable
         if (_pool.TryIncrementCounter(parent)) groupParent = parent;
 
         _pool.SetupJob(groupId, groupGen, &JobTypePool<EmptyJob>.Execute, groupParent);
-        JobHandle groupHandle = new JobHandle(groupId, groupGen);
+        var groupHandle = new JobHandle(groupId, groupGen);
 
         for (int i = 0; i < batches; i++)
         {
@@ -122,7 +129,7 @@ public sealed unsafe class Scheduler : IDisposable
         if (!handle.IsValid) return;
 
         ref var counter = ref _pool.Counters[handle.Index];
-        SpinWait spin = new SpinWait();
+        var spin = new SpinWait();
 
         while (true)
         {
@@ -172,28 +179,35 @@ public sealed unsafe class Scheduler : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void Finish(JobHandle job)
     {
-        int id = job.Index;
+        JobHandle currentJob = job;
 
-        long current = Volatile.Read(ref _pool.Counters[id].Value);
-        long next;
-        while (true)
+        while (currentJob.IsValid)
         {
-            if ((int)(current >> 32) != job.Generation) return;
-            next = current - 1;
-            long actual = Interlocked.CompareExchange(ref _pool.Counters[id].Value, next, current);
-            if (actual == current) break;
-            current = actual;
+            int id = currentJob.Index;
+            long current = Volatile.Read(ref _pool.Counters[id].Value);
+            long next;
+
+            while (true)
+            {
+                if ((int)(current >> 32) != currentJob.Generation) return;
+                next = current - 1;
+                long actual = Interlocked.CompareExchange(ref _pool.Counters[id].Value, next, current);
+                if (actual == current) break;
+                current = actual;
+            }
+
+            if ((int)next != 0) return;
+
+            JobHandle parent = _pool.Parents[id];
+            _pool.Return(id);
+
+            currentJob = parent;
         }
-
-        if ((int)next != 0) return;
-
-        JobHandle parent = _pool.Parents[id];
-        if (parent.IsValid)
-            Finish(parent);
-
-        _pool.Return(id);
     }
 
+    /// <summary>
+    /// Освобождает ресурсы, используемые планировщиком задач, и останавливает все рабочие потоки.
+    /// </summary>
     public void Dispose()
     {
         if (_isDisposed) return;
